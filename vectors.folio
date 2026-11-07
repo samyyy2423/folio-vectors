@@ -1,0 +1,500 @@
+# A vector store, in Folio alone: vectors (embeddings) kept with an id, their text and what you say of them (a
+# dictionary), searched for the ones most like a query, the best first, and saved to a file and loaded again.
+# The store a RAG system keeps its chunks in, or anything found by meaning.
+#
+#   use the package "vectors" as vectors
+#   set notes to vectors's store()                   # cosine similarity; or store_by("dot") or store_by("l2")
+#   set id to vectors's insert(notes, (list of 0.1, 0.8, 0.3), "bees fly by day", dictionary where "page" is 2)
+#   vectors's put(notes, "intro", (list of 0.9, 0.1, 0.0), "folios fly at night", nothing)   # an id of yours
+#   for each found in vectors's search(notes, (list of 0.2, 0.7, 0.3), 5)
+#       say found's score " " found's text " " found's meta
+#   end
+#   say vectors's search_where(notes, query, 5, dictionary where "page" is 2)   # only these
+#   vectors's save(notes, "notes.vectors")
+#   set again to vectors's load("notes.vectors")
+#
+# Each search is every vector times the query at once (arrays.folio's matmul, in machine code in a program
+# folio run or folio build makes), and the best k kept as it goes: about 10 milliseconds for 20,000 vectors of
+# 384 numbers. A file keeps each vector as a 32-bit float (as embeddings are), so 384 numbers are 1.5 KB.
+
+use "arrays.folio" as vec_arrays
+use "memory.folio" as vec_memory
+use "json.folio" as vec_json
+use "math.folio" as vec_math
+
+# ---------- making and changing ----------
+
+# a store that ranks by cosine similarity: how alike two vectors' directions are, from -1 to 1
+to store
+    return store_by("cosine")
+end
+
+# a store that ranks by "cosine", "dot" (the dot product, for vectors made for it) or "l2" (the nearest, by
+# straight-line distance: score is the distance taken from 0, and each found has its distance)
+to store_by with metric
+    if metric is not "cosine" and metric is not "dot" and metric is not "l2"
+        fail with "a vector store ranks by \"cosine\", \"dot\" or \"l2\", not " + metric
+    end
+    return record with kind "vector store", metric metric, width 0, ids empty list, slot_of empty dictionary, texts empty list,
+        metas empty list, numbers empty list, norms empty list, matrix nothing, live 0, next_id 1
+end
+
+# a vector (a list of numbers, or an array) with its text and meta (a dictionary, or nothing), under the next
+# number for an id: the id
+to insert with s, vector, words, meta
+    set id to s's next_id
+    put(s, id, vector, words, meta)
+    return id
+end
+
+# many at once: vectors as an array with a row each (as ai.folio's embed gives) or a list of them, and their
+# texts and metas (lists, or nothing): their ids
+to insert_many with s, many, texts, metas
+    set rows to vec_rows(many)
+    set made to empty list
+    for each k from 1 to length of rows
+        set words to nothing
+        if texts is not nothing
+            set words to item k of texts
+        end
+        set meta to nothing
+        if metas is not nothing
+            set meta to item k of metas
+        end
+        add insert(s, item k of rows, words, meta) to made
+    end
+    return made
+end
+
+# a vector under an id of your own (a number or text): a new one, or in place of the one with that id
+to put with s, id, vector, words, meta
+    set v to vec_vector(vector)
+    if s's width is 0
+        if length of v is 0
+            fail with "a vector needs numbers in it"
+        end
+        set s's width to length of v
+    end
+    if length of v is not s's width
+        fail with "this store's vectors have " + s's width + " numbers, not " + length of v
+    end
+    set norm to vec_norm(v)
+    if s's metric is "cosine"
+        if norm is 0
+            fail with "a vector of zeros has no direction for cosine similarity"
+        end
+        set scaled to empty list
+        for each x in v
+            add x / norm to scaled
+        end
+        set v to scaled
+    end
+    set numbers to s's numbers
+    if id is in s's slot_of
+        set slot to item id of s's slot_of
+        set base to (slot - 1) * s's width
+        for each k from 1 to s's width
+            set item (base + k) of numbers to item k of v
+        end
+        set item slot of s's texts to words
+        set item slot of s's metas to meta
+        set item slot of s's norms to norm * norm
+    else
+        for each x in v
+            add x to numbers
+        end
+        set into_list to s's ids
+        add id to into_list
+        set into_list to s's texts
+        add words to into_list
+        set into_list to s's metas
+        add meta to into_list
+        set into_list to s's norms
+        add norm * norm to into_list
+        set item id of s's slot_of to length of s's ids
+        set s's live to s's live + 1
+    end
+    if not vec_is_text(id) and id is at least s's next_id
+        set s's next_id to (id rounded down) + 1
+    end
+    set s's matrix to nothing
+end
+
+# the vector with this id taken out: whether there was one
+to delete with s, id
+    if not (id is in s's slot_of)
+        return no
+    end
+    set slot to item id of s's slot_of
+    set item slot of s's ids to nothing
+    set item slot of s's texts to nothing
+    set item slot of s's metas to nothing
+    set slots to s's slot_of
+    remove id from slots
+    set s's live to s's live - 1
+    return yes
+end
+
+# what the store has under an id: a record of id, text, meta and vector (as kept: for cosine, its length 1), or
+# nothing
+to get with s, id
+    if not (id is in s's slot_of)
+        return nothing
+    end
+    set slot to item id of s's slot_of
+    set base to (slot - 1) * s's width
+    set v to empty list
+    for each k from 1 to s's width
+        add item (base + k) of s's numbers to v
+    end
+    return record with id id, text item slot of s's texts, meta item slot of s's metas, vector v
+end
+
+# how many vectors the store has
+to size with s
+    return s's live
+end
+
+# their ids, in the order they came
+to ids with s
+    set made to empty list
+    for each id in s's ids
+        if id is not nothing
+            add id to made
+        end
+    end
+    return made
+end
+
+# ---------- searching ----------
+
+# the k most like the query, the best first: each a record of id, score, text and meta (and distance, for l2)
+to search with s, query, k
+    return search_where(s, query, k, nothing)
+end
+
+# The same, of only those the filter lets through: a dictionary of what their meta must have (each key with
+# that value), or a function given the found record (id, text, meta) that says yes or no
+to search_where with s, query, k, filter
+    return item 1 of vec_search(s, (list of query), k, filter)
+end
+
+# many queries at once (a list of vectors, or an array with a row each): for each, its k best, as search gives
+to search_many with s, queries, k
+    return vec_search(s, vec_rows(queries), k, nothing)
+end
+
+to vec_search with s, queries, k, filter
+    set m to length of queries
+    set made to empty list
+    if s's live is 0 or m is 0
+        for each j from 1 to m
+            add empty list to made
+        end
+        return made
+    end
+    set w to s's width
+    set qs to empty list
+    set q_norms to empty list
+    for each query in queries
+        set q to vec_vector(query)
+        if length of q is not w
+            fail with "this store's vectors have " + w + " numbers, and the query has " + length of q
+        end
+        set norm to vec_norm(q)
+        if s's metric is "cosine"
+            if norm is 0
+                fail with "a query of zeros has no direction for cosine similarity"
+            end
+            for each x in q
+                add x / norm to qs
+            end
+        else
+            for each x in q
+                add x to qs
+            end
+        end
+        add norm * norm to q_norms
+    end
+    # every vector times every query: n by m
+    set n to length of s's ids
+    set products to vec_arrays's numbers_of(vec_arrays's matmul(vec_matrix(s), vec_arrays's transpose(vec_arrays's shaped(qs, list of m, w))))
+    for each j from 1 to m
+        add vec_best(s, products, n, m, j, item j of q_norms, k, filter) to made
+    end
+    return made
+end
+
+# query j's k best: kept as they're found, the best first, and a later one with the same score after
+to vec_best with s, products, n, m, j, q_norm, k, filter
+    set best to empty list
+    set scores to empty list
+    for each slot from 1 to n
+        set id to item slot of s's ids
+        if id is not nothing
+            set score to item ((slot - 1) * m + j) of products
+            if s's metric is "l2"
+                set score to -vec_distance(item slot of s's norms + q_norm - 2 * score)
+            end
+            set count to length of best
+            if count is less than k or score is greater than item count of scores
+                set found to record with id id, score score, text item slot of s's texts, meta item slot of s's metas
+                if s's metric is "l2"
+                    set found to record with id id, score score, distance -score, text item slot of s's texts, meta item slot of s's metas
+                end
+                if vec_passes(found, filter)
+                    set at to count + 1
+                    repeat while at is greater than 1 and score is greater than item (at - 1) of scores
+                        set at to at - 1
+                    end
+                    vec_insert(best, at, found)
+                    vec_insert(scores, at, score)
+                    if length of best is greater than k
+                        set best to items 1 to k of best
+                        set scores to items 1 to k of scores
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+to vec_distance with squared
+    if squared is less than 0
+        return 0
+    end
+    return vec_math's sqrt(squared)
+end
+
+to vec_insert with list_of, at, x
+    add x to list_of
+    set k to length of list_of
+    repeat while k is greater than at
+        set item k of list_of to item (k - 1) of list_of
+        set k to k - 1
+    end
+    set item at of list_of to x
+end
+
+to vec_passes with found, filter
+    if filter is nothing
+        return yes
+    end
+    if vec_is_dictionary(filter)
+        set meta to found's meta
+        if meta is nothing
+            return no
+        end
+        for each key in keys of filter
+            if not (key is in meta)
+                return no
+            end
+            if item key of meta is not item key of filter
+                return no
+            end
+        end
+        return yes
+    end
+    return filter(found)
+end
+
+# the store's vectors as an array with a row each, made again only when they've changed
+to vec_matrix with s
+    if s's matrix is nothing
+        set s's matrix to vec_arrays's shaped(s's numbers, list of length of s's ids, s's width)
+    end
+    return s's matrix
+end
+
+# ---------- files ----------
+
+# The store written to a file (needs --allow-write): a line that says what it is, then each vector's id, meta
+# (as JSON) and text, then the vectors, each number as a 32-bit float. Taken-out vectors aren't written.
+to save with s, file
+    set head to empty list
+    set rows to empty list
+    set kept to 0
+    for each slot from 1 to length of s's ids
+        set id to item slot of s's ids
+        if id is not nothing
+            add 1 to kept
+            set words to item slot of s's texts
+            set text_bytes to "" as bytes
+            set has_text to 0
+            if words is not nothing
+                set text_bytes to ("" + words) as bytes
+                set has_text to 1
+            end
+            set meta to item slot of s's metas
+            add (id as json) + "\t" + (meta as json) + "\t" + has_text + "\t" + length of text_bytes + "\n" to head
+            add text_bytes to head
+            add "\n" to head
+            add slot to rows
+        end
+    end
+    set top to "folio vectors 1\n" + s's width + " " + s's metric + " " + kept + " " + s's next_id + "\n"
+    set parts to empty list
+    add top as bytes to parts
+    for each part in head
+        if vec_is_text(part)
+            add part as bytes to parts
+        else
+            add part to parts
+        end
+    end
+    set total to 0
+    for each part in parts
+        set total to total + length of part
+    end
+    set floats to kept * s's width * 4
+    set out to (total + floats) bytes
+    set at to 1
+    for each part in parts
+        if length of part is greater than 0
+            vec_memory's copy(part, 1, out, at, length of part)
+        end
+        set at to at + length of part
+    end
+    set numbers to empty list
+    for each slot in rows
+        set base to (slot - 1) * s's width
+        for each k from 1 to s's width
+            add item (base + k) of s's numbers to numbers
+        end
+    end
+    if floats is greater than 0
+        vec_memory's put_many(out, at, numbers, "a float")
+    end
+    write out to file
+end
+
+# a store save wrote, from its file (needs --allow-read)
+to load with file
+    set data to read bytes file
+    set n to length of data
+    set first to vec_line_end(data, 1)
+    if first is 0 or (items 1 to first - 1 of data) as text is not "folio vectors 1"
+        fail with file + " isn't a vector store that save wrote"
+    end
+    set second to vec_line_end(data, first + 1)
+    set facts to split ((items first + 1 to second - 1 of data) as text) by " "
+    set s to store_by(item 2 of facts)
+    set w to number of (item 1 of facts)
+    set count to number of (item 3 of facts)
+    set s's width to w
+    set at to second + 1
+    set numbers to empty list
+    if count is greater than 0
+        set floats_at to n - count * w * 4 + 1
+        set numbers to vec_memory's get_many(data, floats_at, count * w, "a float")
+    end
+    for each k from 1 to count
+        set ends to vec_line_end(data, at)
+        set fields to split ((items at to ends - 1 of data) as text) by "\t"
+        set id to vec_json's parse(item 1 of fields)
+        set meta to vec_json's parse(item 2 of fields)
+        set text_length to number of (item 4 of fields)
+        set words to nothing
+        if item 3 of fields is "1"
+            set words to ""
+            if text_length is greater than 0
+                set words to (items ends + 1 to ends + text_length of data) as text
+            end
+        end
+        set at to ends + 1 + text_length + 1
+        set v to items ((k - 1) * w + 1) to (k * w) of numbers
+        vec_load_one(s, id, v, words, meta)
+    end
+    set s's next_id to number of (item 4 of facts)
+    return s
+end
+
+# a loaded vector, as kept: not scaled again
+to vec_load_one with s, id, v, words, meta
+    set into_list to s's numbers
+    for each x in v
+        add x to into_list
+    end
+    set into_list to s's ids
+    add id to into_list
+    set into_list to s's texts
+    add words to into_list
+    set into_list to s's metas
+    add meta to into_list
+    set norm to vec_norm(v)
+    set into_list to s's norms
+    add norm * norm to into_list
+    set item id of s's slot_of to length of s's ids
+    set s's live to s's live + 1
+end
+
+# where the line from `at` ends: its \n
+to vec_line_end with data, at
+    set k to at
+    set n to length of data
+    repeat while k is at most n
+        if item k of data is 10
+            return k
+        end
+        add 1 to k
+    end
+    return 0
+end
+
+# ---------- vectors ----------
+
+# a vector as a list of numbers: a list as it is, or an array's numbers
+to vec_vector with v
+    try
+        set probe to v's shape
+        return vec_arrays's numbers_of(vec_arrays's flatten(v))
+    if it fails
+    end
+    return v
+end
+
+# many vectors: an array's rows, or a list of vectors
+to vec_rows with many
+    try
+        set shape to many's shape
+        if length of shape is 1
+            return list of vec_arrays's numbers_of(many)
+        end
+        set numbers to vec_arrays's numbers_of(many)
+        set w to item 2 of shape
+        set made to empty list
+        for each r from 1 to item 1 of shape
+            add items ((r - 1) * w + 1) to (r * w) of numbers to made
+        end
+        return made
+    if it fails
+    end
+    return many
+end
+
+to vec_norm with v
+    set total to 0
+    for each x in v
+        set total to total + x * x
+    end
+    return vec_math's sqrt(total)
+end
+
+to vec_is_text with v
+    try
+        set probe to uppercase of v
+        return yes
+    if it fails
+        return no
+    end
+end
+
+to vec_is_dictionary with v
+    try
+        set probe to keys of v
+        return yes
+    if it fails
+        return no
+    end
+end

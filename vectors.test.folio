@@ -1,0 +1,172 @@
+# vectors.folio's tests: folio test --allow-read --allow-write vectors.test.folio
+
+use "vectors.folio" as vectors
+use "arrays.folio" as arrays
+use "math.folio" as math
+
+to close_to with a, b
+    set d to a - b
+    if d is less than 0
+        set d to -d
+    end
+    return d is less than 0.000001
+end
+
+# x, y, x and y, and z: a query near x and y finds "xy" first, then "x", "y", and "z" (at right angles) last
+to four
+    set s to vectors's store()
+    vectors's insert(s, (list of 1, 0, 0), "x", dictionary where "axis" is "x")
+    vectors's insert(s, (list of 0, 1, 0), "y", dictionary where "axis" is "y")
+    vectors's insert(s, (list of 1, 1, 0), "xy", nothing)
+    vectors's insert(s, (list of 0, 0, 2), "z", dictionary where "axis" is "z")
+    return s
+end
+
+to texts_of with found
+    set made to empty list
+    for each f in found
+        add f's text to made
+    end
+    return made
+end
+
+to test_cosine_search
+    set s to four()
+    expect vectors's size(s) is 4
+    expect vectors's ids(s) is list of 1, 2, 3, 4
+    set found to vectors's search(s, (list of 1, 0.9, 0), 4)
+    expect texts_of(found) is list of "xy", "x", "y", "z"
+    expect close_to((item 1 of found)'s score, 1.9 / (math's sqrt(2) * math's sqrt(1.81)))
+    expect close_to((item 2 of found)'s score, 1 / math's sqrt(1.81))
+    expect close_to((item 4 of found)'s score, 0)
+    expect (item 1 of found)'s id is 3
+    expect (item 2 of found)'s meta is dictionary where "axis" is "x"
+    # the length of a vector doesn't matter to cosine: z is 2 long, and its own direction is a perfect match
+    expect close_to((item 1 of vectors's search(s, (list of 0, 0, 5), 1))'s score, 1)
+    expect texts_of(vectors's search(s, (list of 1, 0.9, 0), 2)) is list of "xy", "x"
+    expect length of vectors's search(s, (list of 1, 0, 0), 10) is 4
+end
+
+to test_ids_put_and_delete
+    set s to four()
+    vectors's put(s, "intro", (list of 0, 1, 1), "intro", nothing)
+    expect vectors's size(s) is 5
+    expect (item 1 of vectors's search(s, (list of 0, 1, 1), 1))'s id is "intro"
+    # in place of the one with that id
+    vectors's put(s, 2, (list of 0, 1, 0.1), "y again", nothing)
+    expect vectors's size(s) is 5
+    expect vectors's get(s, 2)'s text is "y again"
+    expect vectors's delete(s, 1) is yes
+    expect vectors's delete(s, 1) is no
+    expect vectors's get(s, 1) is nothing
+    expect vectors's size(s) is 4
+    expect vectors's ids(s) is list of 2, 3, 4, "intro"
+    # z and intro score the same (0): the one that came first is first
+    expect texts_of(vectors's search(s, (list of 1, 0, 0), 10)) is list of "xy", "y again", "z", "intro"
+    # ids go on from the highest number there's been
+    expect vectors's insert(s, (list of 1, 2, 3), "next", nothing) is 5
+    vectors's put(s, 10, (list of 3, 2, 1), "ten", nothing)
+    expect vectors's insert(s, (list of 1, 1, 1), "after ten", nothing) is 11
+end
+
+to test_filters
+    set s to four()
+    set found to vectors's search_where(s, (list of 1, 0.9, 0), 4, dictionary where "axis" is "y")
+    expect texts_of(found) is list of "y"
+    set no_xy to function with f gives f's text is not "xy"
+    expect texts_of(vectors's search_where(s, (list of 1, 0.9, 0), 2, no_xy)) is list of "x", "y"
+end
+
+to test_dot_and_l2
+    set d to vectors's store_by("dot")
+    vectors's insert(d, (list of 1, 0), "one", nothing)
+    vectors's insert(d, (list of 3, 0), "three", nothing)
+    vectors's insert(d, (list of 0, 5), "up", nothing)
+    # by the dot product, length counts
+    expect texts_of(vectors's search(d, (list of 1, 0.1), 3)) is list of "three", "one", "up"
+    expect close_to((item 1 of vectors's search(d, (list of 1, 0.1), 3))'s score, 3)
+    set l to vectors's store_by("l2")
+    vectors's insert(l, (list of 0, 0), "origin", nothing)
+    vectors's insert(l, (list of 3, 4), "five away", nothing)
+    vectors's insert(l, (list of 1, 1), "near", nothing)
+    set found to vectors's search(l, (list of 0.9, 1.1), 3)
+    expect texts_of(found) is list of "near", "origin", "five away"
+    expect close_to((item 3 of vectors's search(l, (list of 0, 0), 3))'s distance, 5)
+    expect close_to((item 3 of vectors's search(l, (list of 0, 0), 3))'s score, -5)
+end
+
+to test_many_at_once
+    set s to vectors's store()
+    set rows to arrays's array(list of (list of 1, 0), (list of 0, 1), (list of 1, 1))
+    expect vectors's insert_many(s, rows, (list of "a", "b", "ab"), nothing) is list of 1, 2, 3
+    set answers to vectors's search_many(s, (list of (list of 1, 0.1), (list of 0.1, 1)), 1)
+    expect length of answers is 2
+    expect (item 1 of item 1 of answers)'s text is "a"
+    expect (item 1 of item 2 of answers)'s text is "b"
+    # an array of queries, a row each
+    set again to vectors's search_many(s, arrays's array(list of (list of 1, 0.1), (list of 0.1, 1)), 2)
+    expect texts_of(item 2 of again) is list of "b", "ab"
+end
+
+to test_ties_keep_their_order
+    set s to vectors's store()
+    for each name in list of "first", "second", "third"
+        vectors's insert(s, (list of 1, 0), name, nothing)
+    end
+    expect texts_of(vectors's search(s, (list of 1, 0), 2)) is list of "first", "second"
+end
+
+to test_save_and_load
+    set s to four()
+    vectors's put(s, "notes", (list of 0.25, -0.5, 0.125), "two lines\nand ✓ café", dictionary where "tags" is (list of "a", "b"), "page" is 7)
+    vectors's put(s, "blank", (list of 1, 2, 2), "", nothing)
+    vectors's put(s, "untexted", (list of 2, 1, 2), nothing, nothing)
+    vectors's delete(s, 2)
+    vectors's save(s, "test.vectors")
+    set again to vectors's load("test.vectors")
+    expect vectors's size(again) is vectors's size(s)
+    expect vectors's ids(again) is vectors's ids(s)
+    expect vectors's get(again, "notes")'s text is "two lines\nand ✓ café"
+    expect vectors's get(again, "notes")'s meta is dictionary where "tags" is (list of "a", "b"), "page" is 7
+    expect vectors's get(again, "blank")'s text is ""
+    expect vectors's get(again, "untexted")'s text is nothing
+    expect vectors's get(again, 2) is nothing
+    set query to list of 0.3, -0.4, 0.25
+    set before to vectors's search(s, query, 6)
+    set after to vectors's search(again, query, 6)
+    expect texts_of(after) is texts_of(before)
+    for each k from 1 to length of before
+        # kept as 32-bit floats: the same to about 7 digits
+        set d to (item k of after)'s score - (item k of before)'s score
+        expect d * d is less than 0.0000000001
+    end
+    expect vectors's insert(again, (list of 1, 1, 1), "new", nothing) is 5
+    # an empty store too
+    vectors's save(vectors's store_by("l2"), "empty.vectors")
+    set none to vectors's load("empty.vectors")
+    expect vectors's size(none) is 0
+    expect none's metric is "l2"
+end
+
+to test_mistakes
+    set s to four()
+    for each attempt in list of "width", "zeros", "query", "metric", "file"
+        try
+            if attempt is "width"
+                vectors's insert(s, (list of 1, 2), "two numbers", nothing)
+            else if attempt is "zeros"
+                vectors's insert(s, (list of 0, 0, 0), "nothing", nothing)
+            else if attempt is "query"
+                vectors's search(s, (list of 1, 2, 3, 4), 1)
+            else if attempt is "metric"
+                vectors's store_by("manhattan")
+            else
+                write "not a store" to "not.vectors"
+                vectors's load("not.vectors")
+            end
+            expect attempt is "a mistake"
+        if it fails with why
+            expect length of why is greater than 10
+        end
+    end
+end

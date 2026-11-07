@@ -1,0 +1,2 @@
+# Folio files keep LF line endings everywhere, so `folio tidy --check` sees them as they are
+* text=auto eol=lf
